@@ -29,55 +29,71 @@ with DAG(
     
     # Define constants
     STOCK_TABLE = "dev.raw_data.stock_data"
-    STOCKS = ["NVDA", "AAPL"]
     
     @task
-    def extract_stock_data():
+    def extract() -> Dict[str, Any]:
         """
         Extract stock data from Alpha Vantage API
         """
-        # Get Alpha Vantage API key from Airflow Variables
+        # Get API key from Airflow variables
         api_key = Variable.get("alpha_vantage_api_key")
-        all_stock_data = {}
+        stock_symbol = Variable.get("stock_symbol", default_var="AAPL")  # Default to AAPL if not set
         
-        for stock in STOCKS:
-            url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={stock}&outputsize=compact&apikey={api_key}"
+        # API endpoint for daily time series
+        url = f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY&symbol={stock_symbol}&outputsize=compact&apikey={api_key}"
+        
+        try:
             response = requests.get(url)
+            response.raise_for_status()  # Raise an exception for HTTP errors
             data = response.json()
             
-            if "Time Series (Daily)" in data:
-                # Get the last 90 days of data
-                time_series = data["Time Series (Daily)"]
-                # Sort by date and get the first 90 entries
-                sorted_dates = sorted(time_series.keys(), reverse=True)[:90]
-                
-                filtered_data = {date: time_series[date] for date in sorted_dates}
-                all_stock_data[stock] = filtered_data
-            else:
-                raise ValueError(f"Failed to fetch data for {stock}: {data}")
-        
-        return all_stock_data
+            # Validate the response structure
+            if "Time Series (Daily)" not in data:
+                raise ValueError(f"Unexpected API response structure: {data.keys()}")
+            
+            return data
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching data from Alpha Vantage: {e}")
+            raise
+        except ValueError as e:
+            print(f"Error in API response: {e}")
+            raise
     
     @task
-    def transform_stock_data(stock_data):
+    def transform(data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Transform the raw API data into a structured format
+        Transform the raw API response into a structured format
         """
-        transformed_data = []
-        
-        for stock, time_series in stock_data.items():
-            for date, values in time_series.items():
-                transformed_data.append({
-                    "stock_symbol": stock,
+        try:
+            # Extract time series data
+            time_series = data["Time Series (Daily)"]
+            
+            # Transform into a list of records
+            records = []
+            symbol = Variable.get("stock_symbol", default_var="AAPL")
+            
+            # Get the last 90 days of data (API response is in descending order by date)
+            count = 0
+            for date, daily_data in time_series.items():
+                if count >= 90:  # Limit to 90 days
+                    break
+                
+                record = {
+                    "stock_symbol": symbol,
                     "date": date,
-                    "open": float(values["1. open"]),
-                    "high": float(values["2. high"]),
-                    "low": float(values["3. low"]),
-                    "close": float(values["4. close"]),
-                    "volume": int(values["5. volume"])
-                })
-        
-        return transformed_data
+                    "open": float(daily_data["1. open"]),
+                    "high": float(daily_data["2. high"]),
+                    "low": float(daily_data["3. low"]),
+                    "close": float(daily_data["4. close"]),
+                    "volume": int(daily_data["5. volume"])
+                }
+                records.append(record)
+                count += 1
+            
+            return records
+        except Exception as e:
+            print(f"Error transforming data: {e}")
+            raise
     
     @task
     def create_table_if_not_exists():
@@ -108,6 +124,7 @@ with DAG(
         Load transformed data to Snowflake using SQL transaction
         """
         hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+        symbol = Variable.get("stock_symbol", default_var="AAPL")
         
         # Prepare values for bulk insert
         values_list = []
@@ -120,7 +137,7 @@ with DAG(
         # SQL for full refresh using transaction
         sql_statements = [
             f"BEGIN TRANSACTION;",
-            f"DELETE FROM {STOCK_TABLE} WHERE stock_symbol IN ({', '.join([f\"'{stock}'\" for stock in STOCKS])});",
+            f"DELETE FROM {STOCK_TABLE} WHERE stock_symbol = '{symbol}';",
             f"INSERT INTO {STOCK_TABLE} (stock_symbol, date, open, close, high, low, volume) VALUES {values_str};",
             f"COMMIT;"
         ]
@@ -150,19 +167,20 @@ with DAG(
         Verify the idempotency of the pipeline by checking record counts
         """
         hook = SnowflakeHook(snowflake_conn_id='snowflake_conn')
+        symbol = Variable.get("stock_symbol", default_var="AAPL")
         
         record_count_sql = f"""
         SELECT COUNT(*) FROM {STOCK_TABLE} 
-        WHERE stock_symbol IN ({', '.join([f"'{stock}'" for stock in STOCKS])})
+        WHERE stock_symbol = '{symbol}'
         """
         
         result = hook.get_first(record_count_sql)
-        return f"Total records: {result[0]}"
+        return f"Total records for {symbol}: {result[0]}"
     
     # Define task dependencies
     table_task = create_table_if_not_exists()
-    extracted_data = extract_stock_data()
-    transformed_data = transform_stock_data(extracted_data)
+    extracted_data = extract()
+    transformed_data = transform(extracted_data)
     load_result = load_to_snowflake(transformed_data)
     verify_result = verify_idempotency()
     
